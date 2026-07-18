@@ -1,0 +1,173 @@
+name: Automated Security Scanning (NIST CSF Aligned)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly scheduled scan — supports NIST CSF DE.CM-8 (vulnerability scans performed)
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+
+  # -------------------------------------------------------------------
+  # SAST — NIST CSF: ID.RA-1, DE.CM-4 | SSDF: PW.7
+  # -------------------------------------------------------------------
+  sast-codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['python', 'javascript'] # edit to match your repo's languages
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "sast-${{ matrix.language }}"
+          upload: true
+
+      - name: Export SARIF for compliance report
+        run: mkdir -p scan-results && echo "codeql-${{ matrix.language }}-complete" >> scan-results/sast-status.txt
+
+      - name: Upload SAST artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results-${{ matrix.language }}
+          path: scan-results/
+          retention-days: 90
+
+  # -------------------------------------------------------------------
+  # SCA / Dependency Vulnerabilities — NIST CSF: ID.RA-1, ID.SC-2 | SSDF: PW.4
+  # -------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency & Vulnerability Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem mode)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'   # set to '1' to fail builds on findings once tuned
+
+      - name: Upload Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'dependency-scan'
+
+      - name: GitHub Dependency Review (PRs only)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+
+      - name: Upload dependency scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results
+          path: trivy-results.sarif
+          retention-days: 90
+
+  # -------------------------------------------------------------------
+  # Secrets Scanning — NIST CSF: PR.AC-1, PR.DS-5 | SSDF: PW.6
+  # -------------------------------------------------------------------
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -------------------------------------------------------------------
+  # SBOM Generation — NIST CSF: ID.AM-2, ID.SC-2 | SSDF: PS.3, PW.4
+  # Executive Order 14028 also requires SBOMs for federal software supply chains
+  # -------------------------------------------------------------------
+  sbom-generation:
+    name: SBOM Generation (Syft)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (CycloneDX format)
+        uses: anchore/sbom-action@v0.17.0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 180  # SBOMs retained longer to support supply chain audits
+
+  # -------------------------------------------------------------------
+  # Governance Reporting — aggregates all scans into a NIST CSF report
+  # NIST CSF: ID.GV-1, DE.DP-4 (detection results communicated)
+  # -------------------------------------------------------------------
+  compliance-report:
+    name: Generate Governance Report
+    needs: [sast-codeql, dependency-scan, secrets-scan, sbom-generation]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-scan-results
+
+      - name: Generate NIST CSF compliance report
+        run: python scripts/generate_compliance_report.py --input all-scan-results --output compliance-report.md
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: nist-csf-compliance-report
+          path: compliance-report.md
+          retention-days: 365  # retained for audit evidence trail
+
+      - name: Add report to job summary
+        run: cat compliance-report.md >> $GITHUB_STEP_SUMMARY
